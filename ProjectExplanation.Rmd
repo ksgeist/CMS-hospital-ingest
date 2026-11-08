@@ -1,0 +1,224 @@
+---
+title: "Developing a Reproducible Computational Pipeline for Hospital-Level Readmissions Analysis Using Routinely-Collected CMS Data"
+author: "Katie Geist"
+date: "14 October 2026"
+output:
+  html_document:
+    toc: true
+subtitle: Biostatistical Computing, BIOS 815 / CPH 656
+bibliography: references.bib
+csl: apa.csl
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, results='hide'}
+# Turn off scientific notation
+options(scipen=999)
+
+# Install pacman if it's missing:
+if (!requireNamespace("pacman", quietly = TRUE)) { install.packages("pacman") }
+
+# Clean, set up, and load
+pacman::p_unload(pacman::p_loaded(), character.only = TRUE)
+pacman::p_load(tidyverse,
+               janitor,
+               naniar,
+               stringr,
+               ggplot2, 
+               kableExtra,
+               RColorBrewer,
+               gridExtra,
+               ggrepel,
+               e1071,
+               caret
+)
+```
+
+# Overview
+
+I have developed and evaluated a reproducible `R`-based computational pipeline for investigating associations between hospital-level characteristics and hospital readmission outcomes using publicly available data from the Centers for Medicare & Medicaid Services (CMS).
+
+## Rationale
+
+Often hospital readmissions analysis are performed at the patient-level rather than hospital-level, with the intention of preventing patient readmission. However, important implications for a different facet of patient care: hospital funding. Hospital-level readmissions impact Medicare reimbursement under the the federal [Hospital Readmissions Reduction Program (HRRP)](https://www.cms.gov/medicare/quality/value-based-programs/hospital-readmissions), which is intended to incentivize hospital-provided patient care and healthcare quality through reimbursement penalties [@cms_hrrp; @medpac2019]. Two recent, independent studies have found a contrary effect in which the program has resulted in higher 30-day mortality rates, possibly indicative that the program may have inadvertently prioritized keeping patients out of the hospital over patient survival [@puebla_neira2021, @rachoin2024]. Further, other unintended trade-offs may have occurred, including shifts toward hospitals "holding" return patients in the emergency room (@rachoin2024) or outpatient care (@medpac2018_hrrp). 
+
+Thus, hospital-level readmission measures are of interest not only as indicators related to the quality and effectiveness of care, but can have consequences beyond clinical outcomes. Readmission measures may be incorporated into quality measurement, reimbursement, resource allocation, and even health policy. Understanding variation in these measures and the hospital characteristics associated with that variation can therefore provide insight into an aspect of healthcare delivery that has both clinical and policy implications.
+
+## Motivation
+
+The project was motivated by an analogous research effort for my current work with an organizational-level foci rather than patient-level dealing with spatially-structured data. 
+
+## Project Goal
+
+The goal of this midterm project was to develop a flexible computational workflow. CMS hospital-level aggregates of readmissions are reported annually, by each hospital, and across 6 difference readmission metrics:
+
+1. Pneumonia (PN)
+2. Chronic Obstructive Pulmonary Disease (COPD)
+3. Heart Failure (HF)
+4. Acute Myocardial Infarction (AMI)
+5. Coronary Artery Bypass Graft (CABG)
+6. Total Hip/Knee Arthroplasty (HIP-KNEE)
+
+### Structure of the Data
+
+Hospitals report metrics to CMS annually under the [Hospital Readmissions Reduction Program (HRRP)](https://www.cms.gov/medicare/quality/value-based-programs/hospital-readmissions) and have been doing so since 2013. Thus, if using the historic data archives (available for the most recent 7 years), data are __temporally-structured__ due to the longitudinal nature of the data. Further, these data are __spatially-structured__ because hospitals exist within counties and states that share underlying population demographics, policies, and occupational and environmental exposures. 
+
+Thus, in order to avoid the inherent temporal structure of historical data to focus on only the spatial structure, I used CMS' API to access these data. By using the current CMS hospital data (i.e., what CMS uses to assess penalties to hospitals). The pipeline was designed to not only investigate patterns in hospital readmission outcomes, but also assess whether those outcomes exhibit spatial autocorrelation to address the remaining likely spatial structure of the data. 
+
+### Processing & Analytical Pipeline
+
+The pipeline currently includes:
+
+1. Data retrieval via API
+2. Data cleaning and preprocessing
+3. Exploratory data analysis
+4. Regression modeling with elastic net regularization
+5. Tests for spatial dependence. 
+
+For the spatial analysis, if the results indicate meaningful spatial autocorrelation, the pipeline is designed to fit a spatial lag regression model and evaluate whether accounting for spatial structure improves model fit. 
+
+The resulting functions for the pipeline were designed to be reusable across different years of CMS data while keeping the scope of the current project manageable.
+
+### Unit of Analysis
+
+The unit of analysis for this project will be the hospital. The CMS data I propose to use in the project are aggregated hospital-level data rather than patient-level electronic health record or encounter data. Therefore, the project cannot attempt to identify individual hospital stays or construct readmission events from patient encounter timestamps. Instead, CMS-provided hospital-level readmission measures will serve as the outcomes for the statistical analysis.
+
+### Research Question
+
+The goal of this workflow is to ultimately understand __how hospital characteristics and quality measured are associated with variation in hospital readmission rates for selected conditions__. A secondary question could examine whether these associations differ across selected readmission conditions.
+
+---
+
+# Pipeline and Methods Walk-through
+
+## 1. Data Retrieval via API
+
+Hospital data are retrieved programmatically from the [CMS Provider Data Catalog API](https://data.cms.gov/provider-data/about) using primarly the `jsonlite` package for its easy ability to read JSON responses directly from API URLs. 
+
+All of this is handled by the source module `retrieveCMShospitalAPI.R`. There are some baked-in global variables, including several functions detailed below and a wrapper that drives the bus. These global variables can be reinitialized by the user and used in the function to provide flexibility in which datasets are pulled, the size of the pagination request (max is 1500 rows) to improve computational efficiency on slower machines or over slower internet connections, and the name of the output directory. However, the function was designed to **do everything needed** without having to change any variables in the global environment as well.
+
+To source the module:
+
+```{r, results='hide'}
+source("retrieveCMShospitalAPI.R")
+```
+
+### 1a. Dataset discovery and identification
+
+The data retrieval pipeline starts by first retrieving the CMS dataset catalog from the API metadata endpoint and converting the returned records into a tabular catalog containing dataset titles, identifiers, and modification dates. This catalog is saved as `full-CMS-catalog.csv` to document the available datasets and assist the user in troubleshooting any incorrect CMS changes dataset names.
+
+#### `grabCatalog()`
+ - Obtains the full CMS dataset catalog from the API endpoint to assist the user in choosing datasets or troubleshooting incorrect names. 
+ - It takes two arguments for an output directory and the base URL for the JSON query of the catalog, both of which default to what is in the global environment from the source script. 
+ - Creates both a CSV version of the catalog for inspection and returns it as a dataframe, which is used by downstream functions. 
+ 
+ 
+*Example*: Run `catalogDF` standalone and use it to obtain all hospital-level datasets to choose:
+```{r}
+catalogDF <- grabCatalog(baseURL = baseURL,
+                         odir = NA) 
+
+## Now take a look at the ones that are candidates for being hospital-level
+catalogDF %>% filter(grepl("Hospital", title)) %>% 
+  ## But also filter out any that end in 'National' or 'State'
+  filter(!grepl("\\s+National$|\\s+State", title)) %>%    
+  kable(
+    format = "html",
+    caption = "Table 1. List of candidate hospital-level data files.") %>%
+    kable_styling(bootstrap_options = c("striped", full_width = F)
+  )
+```
+
+
+#### `standardizeTitle()` 
+- Standardizes dataset titles by converting text to lowercase, removing punctuation and standardizing whitespace. This permits more flexible matching between requested dataset names and catalog entries.
+
+*Example*: How `standardizeTitle()` works when used standalone:
+
+```{r, echo=FALSE}
+cat("Here is the first dataset in the vector of dataset names in the global 
+    environment:\n\n",
+    cmsDatasetNames[1],
+"\n\nand here it is after running the name standardizing function:\n\n",
+standardizeTitle(cmsDatasetNames[1])
+)
+```
+
+#### `findTitle()` 
+- Uses standardized titles from `standardizeTitle()` to locate an exactly matching dataset and retrieve its CMS identifier. This is because the CMS identifier is critical for obtaining the exact datasets requested. 
+- When an exact match cannot be found, the function prints potential alternatives to help the user fix the requested dataset list stored in `datasetNames`. 
+- Takes two arguments, the requested title of a dataset, as well as the catalog of titles generated by `grabCatalog()`. 
+- Provides several forms of error handling, in that it both notifies the user when exact matches cannot be found, if no matches are found from an entire list, and returns candidates to aid in dataset name correction.
+
+
+*Example* after changing the dataset name purposefully to one that doesn't exist so you can see how the function handles errors:
+
+```{r}
+badName <- "General Information"
+findTitle(requestedTitle = badName, catalogDF = catalogDF)
+```
+
+### 1b. Paginated data retrieval
+
+The script's functions retrieve records in pages rather than requesting an entire dataset in a single API call. CMS currently limits the number of records in a single call to 1500; this means that any dataset with more than 1500 observations needs to be obtained in chunks, stored into a list, and then collated, hence the paginated retrieval method.
+
+#### `getCMSpage()` 
+- Constructs a query URL using the dataset identifier, row offset, and page-size limit. 
+- Retrieves the JSON response with `jsonlite::fromJSON()`, which returns the records contained in the response's `results` element. 
+- Stops with an informative error if that element is absent and notifies user.
+
+#### `getCMSdataset()` 
+- Repeatedly calls `getCMSpage()`, beginning at offset zero so that it starts with the first record/page. After each successful request, it advances the offset by the number of records returned and stores the page. 
+- Retrieval stops when a page is empty or contains fewer records than the requested page size. 
+- Successful pages are then collated into a single data frame using row binding.
+- Error handling is not contained within this function, but rather in the wrapper `rawCMS()` (below).
+
+  - **Developer note 1**: I found that a short pause between page requests reduces the frequency of consecutive API calls, which both improved performance on my end but should, in theory at least, reduce risk of security flagging at the endpoint as well. The page-size parameter can also be adjusted to accommodate dataset size and API response performance. Further, I found that `R` itself was prone to timing out on bigger datasets; I found that changing the project-level options using `options(timeout = 300)` was sufficient to resolve that issue for me, but slower machines might need to increase that timeout. For reference, this was run a 32gb RAM machine.
+  
+  - **Developmer note 2**: Although we covered `for()` and `while()` loops in class, here I used the `repeat` loop. This is because the total number of API pages is unknown in advance, and `repeat` allows retrieval to continue until the API indicates that no more records remain. The loop uses break conditions to stop when a page is empty or contains fewer records than the requested page size. This approach keeps the pagination logic straightforward without requiring an estimate of the total number of pages. Although `while()` could have been used here, the exit conditions would have needed to be more explicit. A `for()` loop in particular would have necessitated that we know the number of pages (or at least a good estimate) in advance.
+
+
+### 1c. Wrapper function `rawCMS()` handles endpoint connection, download, and export
+
+Finally, a wrapper function `rawCMS()`, which can be called as a standalone after sourcing the script `retrieveCMShospitalAPI.R` handles:
+
+1. Sequential grabs of the dataset catalog by `grabCatalog()`
+
+2. Verification of the dataset names supplied by the source script or the user (as needed) with `findTitle()` (which calls `standardizeTitle()`)
+
+3. Creates the JSON query, validates connection to the endpoint, downloads paginated reports, and  collates the reports with `getCMSdataset()` (which calls`getCMSpage()`) 
+
+4. Dumps raw CSV files for the user into the output directory, a default of which was set with the source script or can be changed by the user if desired
+
+5. For each successfully retrieved dataset, `cms-retrieval-manifest.csv` file records the requested and returned dataset titles, dataset identifier, retrieval date, row and column counts, and output filename
+
+  - **Developer note 1**: CSV files were chosen, over say `.Rdata` files, in order to be programming language agnostic downstream. This would enable users to say, use the first module but then use a different programming language for analysis.
+
+  - **Developer note 2**: Although we covered `lapply()` in class, this function leverages the `map()` function instead to apply the `findTitle()` function to each element of a vector and it returns a list. It is a modern, type-stable alternative to base R's `lapply()` or explicit `for()` loops.
+
+
+### Final Comments
+
+The retrieval stage is separated from subsequent data cleaning, joining, and statistical analysis to support reproducibility and allow the same downloaded source data to be processed through different analytical workflows. The script preserves all source values, including missing data, and does not do any reshaping or other processing.
+
+The API provides current catalog data; **it should not be assumed to reproduce a specific historical annual release**. Historical analyses require the appropriate archived source files or another verified historical retrieval method. However, downstream modules could potentially be used, or modified to be used, on those archived CSV files provided. **I have observed that the structure is not perfectly maintained between archived CSVs and API-derived CSVs, however, particularly for older years.**
+
+
+## 2. Data Cleaning and Joining
+
+The next task is to 
+
+
+Your current CMS inventory contains 13 datasets, but they do not all have the same structure.
+- Long-format measure tables such as complications_and_deaths and timely_and_effective_care need measure filtering and pivoting.
+- Hospital-level tables such as hospital_general_information and the two HVBP tables are already largely wide, so they should be joined directly rather than forced through the same pivot logic.
+- Readmissions has its own outcome-specific fields, including measure_name, excess_readmission_ratio, and number_of_discharges.
+That means the old idea of giving every dataset the same treatment needs to become a small set of explicit processing rules. We should also check that the selected measure rows are unique at the intended pivot grain before widening them; silently aggregating duplicates could conceal a data problem.
+
+
+
+
+
