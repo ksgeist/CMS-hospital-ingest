@@ -24,6 +24,8 @@ After ingestion and parsing of the JSON files, the pipeline begins handling the 
 - type conversion
 - variable extraction
 
+**Currently the pipeline is not testable end-to-end.** I have it through ingestion and cleanup, but the merges into a final, single dataset are incomplete. 
+
 Future work is to include completing readiness for spatial structure analysis (since data are collected from across every state in the U.S.), as well as machine learning to predict readmissions ratios based on user input and the recommendations from the spatial structure analyses.
 
 Final deployment will be through a Shiny application. 
